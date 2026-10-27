@@ -506,7 +506,10 @@ function incorporarImagensEmbutidas(html, messageId) {
       if (cabecalho && /^image\//i.test(parte.mimeType)) {
         const dados = parte.body.data ||
           Gmail.Users.Messages.Attachments.get("me", messageId, parte.body.attachmentId).data;
-        const base64 = dados.replace(/-/g, "+").replace(/_/g, "/");
+        // O serviço avançado devolve os bytes já decodificados (array); a API REST devolve base64url.
+        const base64 = typeof dados === "string"
+          ? dados.replace(/-/g, "+").replace(/_/g, "/")
+          : Utilities.base64Encode(dados);
         imagens[cabecalho.value.replace(/[<>]/g, "").trim()] = `data:${parte.mimeType};base64,${base64}`;
       }
       (parte.parts || []).forEach(percorrer);
