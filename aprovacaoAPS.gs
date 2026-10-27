@@ -1,13 +1,27 @@
 /**
  * Processa e-mails de aprovação de AP: migra os dados do .xlsm anexado para a
- * planilha de destino e notifica no Google Chat.
+ * planilha de destino, junta os PDFs anexados com o e-mail de aprovação num
+ * único PDF no Drive e notifica no Google Chat com o link.
  *
  * CONFIGURAÇÃO INICIAL (uma vez só):
- * 1. Editor > Serviços (+) > adicionar "Drive API" (v3).
+ * 1. Editor > Serviços (+) > adicionar "Drive API" (v3) e "Gmail API" (v1).
+ *    A Gmail API é usada para recuperar as imagens embutidas (assinaturas, logos).
  * 2. Configurações do projeto > Propriedades do script > Adicionar propriedade:
  *      Nome:  WEBHOOK_CHAT
  *      Valor: URL do NOVO webhook do Google Chat (exclua o antigo, que ficou exposto)
  * 3. Preencha APROVADORES abaixo (ou deixe vazio para aceitar qualquer remetente).
+ * 4. (Opcional) Preencha PASTA_DESTINO_ID com o ID da pasta do Drive onde salvar
+ *    os PDFs. Vazio = usa (ou cria) a pasta NOME_PASTA_PADRAO na raiz do Drive.
+ *    Para ter os arquivos no computador, instale o "Google Drive para computador"
+ *    e marque essa pasta para ficar disponível off-line.
+ *
+ * DOCUMENTO CONSOLIDADO:
+ * - Para cada AP aprovada são gerados na pasta de destino:
+ *     merged_docs - <assunto> - <data>.pdf  -> anexos .pdf da thread + e-mail de aprovação (por último)
+ *     merged_docs - <assunto> - <data>.eml  -> e-mail de aprovação original (comprovante)
+ * - A junção dos PDFs usa a biblioteca pdf-lib, baixada de PDF_LIB_URL a cada execução.
+ * - PDFs protegidos por senha podem falhar; assinaturas digitais de PDFs anexados
+ *   deixam de ser válidas no arquivo final (o conteúdo continua visível).
  *
  * FUNCIONAMENTO EM CASO DE ERRO:
  * - Se algum anexo falhar, a thread é tentada de novo nas próximas execuções.
@@ -26,27 +40,34 @@ const CONFIG = {
   APROVADORES: [],                 // ex.: ["gestor@empresa.com", "diretor@empresa.com"]. Vazio = qualquer remetente
   MAX_THREADS_POR_EXECUCAO: 20,
   MAX_TENTATIVAS: 3,
-  TEMPO_LIMITE_MS: 5 * 60 * 1000   // Para antes do limite de 6 min do Apps Script
+  TEMPO_LIMITE_MS: 5 * 60 * 1000,  // Para antes do limite de 6 min do Apps Script
+  PASTA_DESTINO_ID: "",            // ID da pasta do Drive para os PDFs. Vazio = NOME_PASTA_PADRAO
+  NOME_PASTA_PADRAO: "APs Aprovadas",
+  PREFIXO_ARQUIVO: "merged_docs",
+  PDF_LIB_URL: "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js",
+  MAX_IMAGENS_EXTERNAS: 20,        // Imagens da internet (ex.: assinaturas hospedadas) embutidas no PDF do e-mail
+  MAX_BYTES_IMAGEM: 2 * 1024 * 1024
 };
 
 /**
  * Função principal (é esta que o gatilho deve chamar).
  * O lock impede que duas execuções processem as mesmas threads ao mesmo tempo.
+ * É async porque a junção dos PDFs (pdf-lib) trabalha com Promises.
  */
-function processarEmailsAprovados() {
+async function processarEmailsAprovados() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) {
     Logger.log("Outra execução já está em andamento. Encerrando.");
     return;
   }
   try {
-    executarProcessamento();
+    await executarProcessamento();
   } finally {
     lock.releaseLock();
   }
 }
 
-function executarProcessamento() {
+async function executarProcessamento() {
   const inicio = Date.now();
 
   const webhook = PropertiesService.getScriptProperties().getProperty("WEBHOOK_CHAT");
@@ -70,15 +91,15 @@ function executarProcessamento() {
       Logger.log("[AVISO] Tempo limite atingido; as threads restantes ficam para a próxima execução.");
       break;
     }
-    processarThread(thread, sheet, labelProcessado, labelErro, webhook);
+    await processarThread(thread, sheet, labelProcessado, labelErro, webhook);
   }
 }
 
 /**
  * Processa uma thread: valida a aprovação, migra cada .xlsm (sem repetir os
- * já migrados) e marca a thread como processada ou com erro.
+ * já migrados), gera o PDF consolidado e marca a thread como processada ou com erro.
  */
-function processarThread(thread, sheet, labelProcessado, labelErro, webhook) {
+async function processarThread(thread, sheet, labelProcessado, labelErro, webhook) {
   const messages = thread.getMessages();
   const ultimaMensagem = messages[messages.length - 1];
   const assunto = ultimaMensagem.getSubject();
@@ -126,6 +147,18 @@ function processarThread(thread, sheet, labelProcessado, labelErro, webhook) {
     }
   }
 
+  // Só gera o PDF depois que todos os .xlsm entraram, e uma vez só por thread.
+  if (!houveErro && !estado.documentoUrl) {
+    try {
+      estado.documentoUrl = await gerarDocumentoConsolidado(thread, messages, assunto);
+      props.setProperty(chaveEstado, JSON.stringify(estado));
+      Logger.log(`PDF consolidado gerado: ${estado.documentoUrl} (e-mail "${assunto}")`);
+    } catch (erro) {
+      houveErro = true;
+      Logger.log(`Erro ao gerar o PDF consolidado do e-mail "${assunto}": ${erro}`);
+    }
+  }
+
   if (!houveErro) {
     props.deleteProperty(chaveEstado);
     // Fica acessível clicando na label, como se fosse uma pasta.
@@ -136,7 +169,9 @@ function processarThread(thread, sheet, labelProcessado, labelErro, webhook) {
     const aprovadoPor = extrairNomeRemetente(remetente);
     enviarNotificacaoGoogleChat(
       webhook,
-      `A AP do e-mail "${assunto}" foi aprovada por ${aprovadoPor}\nPróxima ação: entregar ao financeiro`
+      `A AP do e-mail "${assunto}" foi aprovada por ${aprovadoPor}\n` +
+      `Documentos: ${estado.documentoUrl}\n` +
+      `Próxima ação: entregar ao financeiro`
     );
     return;
   }
@@ -151,7 +186,8 @@ function processarThread(thread, sheet, labelProcessado, labelErro, webhook) {
     enviarNotificacaoGoogleChat(
       webhook,
       `⚠️ Falha ao migrar a AP do e-mail "${assunto}" após ${CONFIG.MAX_TENTATIVAS} tentativas. ` +
-      `${estado.migrados.length} de ${anexos.length} arquivo(s) migrado(s). ` +
+      `${estado.migrados.length} de ${anexos.length} arquivo(s) migrado(s)` +
+      `${estado.migrados.length === anexos.length ? " (a falha foi na geração do PDF consolidado)" : ""}. ` +
       `Verifique o log de execuções e remova a label "${CONFIG.LABEL_ERRO}" para tentar de novo.`
     );
   } else {
@@ -387,4 +423,193 @@ function converterXlsmParaGoogleSheets(blobAnexo) {
   };
   const file = Drive.Files.create(fileMetadata, blobAnexo.copyBlob());
   return file.id;
+}
+
+/**
+ * Junta os anexos .pdf da thread (na ordem em que chegaram) com o e-mail de
+ * aprovação (por último) num único PDF e salva também o .eml original.
+ * Retorna o link do PDF no Drive.
+ */
+async function gerarDocumentoConsolidado(thread, messages, assunto) {
+  const ultimaMensagem = messages[messages.length - 1];
+  const nomeBase = montarNomeArquivo(assunto);
+
+  const documentos = obterAnexosPdfUnicos(messages);
+  documentos.push(gerarPdfDoEmail(messages));
+
+  const pdfFinal = await juntarPdfs(documentos);
+  const pasta = obterPastaDestino();
+  const arquivoPdf = pasta.createFile(pdfFinal.setName(nomeBase + ".pdf"));
+
+  // Cópia exata do e-mail de aprovação, com cabeçalhos e assinatura digital (DKIM) do remetente.
+  pasta.createFile(Utilities.newBlob(ultimaMensagem.getRawContent(), "message/rfc822", nomeBase + ".eml"));
+
+  return arquivoPdf.getUrl();
+}
+
+/**
+ * Lista os anexos .pdf de todas as mensagens da thread, na ordem em que
+ * chegaram, sem repetir o mesmo arquivo reenviado em respostas/encaminhamentos.
+ */
+function obterAnexosPdfUnicos(messages) {
+  const vistos = new Set();
+  return messages
+    .flatMap(msg => msg.getAttachments())
+    .filter(anexo => anexo.getName().toLowerCase().endsWith(".pdf") || anexo.getContentType() === MimeType.PDF)
+    .filter(anexo => {
+      const chave = chaveAnexo(anexo);
+      if (vistos.has(chave)) return false;
+      vistos.add(chave);
+      return true;
+    });
+}
+
+/**
+ * Gera um PDF com todas as mensagens da thread (cabeçalho + corpo HTML).
+ * As imagens embutidas (cid:) e as hospedadas na internet são incorporadas
+ * ao HTML antes da conversão, para que assinaturas e logos apareçam no PDF.
+ */
+function gerarPdfDoEmail(messages) {
+  const contador = { externas: 0 };
+  const partes = messages.map(msg => {
+    const corpo = incorporarImagensExternas(incorporarImagensEmbutidas(msg.getBody(), msg.getId()), contador);
+    return `
+      <div style="font-family:Arial,sans-serif;font-size:12px;border-bottom:1px solid #999;padding-bottom:8px;margin-bottom:12px">
+        <b>De:</b> ${escaparHtml(msg.getFrom())}<br>
+        <b>Para:</b> ${escaparHtml(msg.getTo())}<br>
+        ${msg.getCc() ? `<b>Cc:</b> ${escaparHtml(msg.getCc())}<br>` : ""}
+        <b>Data:</b> ${Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm")}<br>
+        <b>Assunto:</b> ${escaparHtml(msg.getSubject())}
+      </div>
+      <div>${corpo}</div>
+      <div style="page-break-after:always"></div>`;
+  });
+
+  const html = `<html><head><meta charset="UTF-8"></head><body>${partes.join("")}</body></html>`;
+  return Utilities.newBlob(html, MimeType.HTML, "email.html").getAs(MimeType.PDF);
+}
+
+/**
+ * Troca cada src="cid:..." pela imagem correspondente em base64 (data URI).
+ * O GmailApp não informa o Content-ID das imagens, por isso usa a Gmail API.
+ * Se algo falhar, mantém o HTML original (o PDF sai sem essas imagens).
+ */
+function incorporarImagensEmbutidas(html, messageId) {
+  if (!/cid:/i.test(html)) return html;
+  try {
+    const imagens = {};
+    const percorrer = parte => {
+      const cabecalho = (parte.headers || []).find(h => /^(content-id|x-attachment-id)$/i.test(h.name));
+      if (cabecalho && /^image\//i.test(parte.mimeType)) {
+        const dados = parte.body.data ||
+          Gmail.Users.Messages.Attachments.get("me", messageId, parte.body.attachmentId).data;
+        const base64 = dados.replace(/-/g, "+").replace(/_/g, "/");
+        imagens[cabecalho.value.replace(/[<>]/g, "").trim()] = `data:${parte.mimeType};base64,${base64}`;
+      }
+      (parte.parts || []).forEach(percorrer);
+    };
+    percorrer(Gmail.Users.Messages.get("me", messageId, { format: "full" }).payload);
+
+    return html.replace(/(["'])cid:([^"']+)\1/gi, (original, aspas, cid) => {
+      const dataUri = imagens[decodeURIComponent(cid).trim()];
+      return dataUri ? aspas + dataUri + aspas : original;
+    });
+  } catch (erro) {
+    Logger.log(`[AVISO] Não foi possível incorporar as imagens embutidas do e-mail ${messageId}: ${erro}`);
+    return html;
+  }
+}
+
+/**
+ * Baixa as imagens <img src="http(s)://..."> e as incorpora em base64, pois o
+ * conversor de HTML para PDF não busca imagens na internet. Imagens que
+ * falharem, forem grandes demais ou passarem do limite ficam como estão.
+ */
+function incorporarImagensExternas(html, contador) {
+  return html.replace(/(<img\b[^>]*?\bsrc\s*=\s*)(["'])(https?:\/\/[^"']+)\2/gi, (original, prefixo, aspas, url) => {
+    if (contador.externas >= CONFIG.MAX_IMAGENS_EXTERNAS) return original;
+    contador.externas++;
+    try {
+      const resposta = UrlFetchApp.fetch(url.replace(/&amp;/g, "&"), { muteHttpExceptions: true, followRedirects: true });
+      const blob = resposta.getBlob();
+      const tipo = String(blob.getContentType() || "");
+      if (resposta.getResponseCode() !== 200 || !/^image\//i.test(tipo) || blob.getBytes().length > CONFIG.MAX_BYTES_IMAGEM) {
+        return original;
+      }
+      return `${prefixo}${aspas}data:${tipo};base64,${Utilities.base64Encode(blob.getBytes())}${aspas}`;
+    } catch (erro) {
+      Logger.log(`[AVISO] Não foi possível baixar a imagem ${url}: ${erro}`);
+      return original;
+    }
+  });
+}
+
+/**
+ * Junta os PDFs na ordem recebida usando a pdf-lib.
+ */
+async function juntarPdfs(blobs) {
+  const PDFLib = carregarPdfLib();
+  const pdfFinal = await PDFLib.PDFDocument.create();
+  for (const blob of blobs) {
+    let doc;
+    try {
+      doc = await PDFLib.PDFDocument.load(new Uint8Array(blob.getBytes()), { ignoreEncryption: true });
+    } catch (erro) {
+      throw new Error(`Não foi possível ler o PDF "${blob.getName()}": ${erro}`);
+    }
+    const paginas = await pdfFinal.copyPages(doc, doc.getPageIndices());
+    paginas.forEach(pagina => pdfFinal.addPage(pagina));
+  }
+  const bytes = await pdfFinal.save();
+  return Utilities.newBlob(Array.from(new Int8Array(bytes.buffer, bytes.byteOffset, bytes.length)), MimeType.PDF);
+}
+
+/**
+ * Baixa e carrega a pdf-lib (uma vez por execução).
+ * O Apps Script não tem setTimeout, que a pdf-lib usa entre etapas; o
+ * substituto abaixo executa a função na hora, o que basta para ela.
+ */
+let pdfLibCarregada = null;
+function carregarPdfLib() {
+  if (pdfLibCarregada) return pdfLibCarregada;
+  if (typeof globalThis.setTimeout !== "function") {
+    globalThis.setTimeout = (funcao, ms) => {
+      if (ms) Utilities.sleep(ms);
+      funcao();
+      return 0;
+    };
+  }
+  const codigo = UrlFetchApp.fetch(CONFIG.PDF_LIB_URL).getContentText();
+  (0, eval)(codigo); // eval indireto: executa no escopo global e define globalThis.PDFLib
+  if (!globalThis.PDFLib) throw new Error("Falha ao carregar a pdf-lib.");
+  pdfLibCarregada = globalThis.PDFLib;
+  return pdfLibCarregada;
+}
+
+function obterPastaDestino() {
+  if (CONFIG.PASTA_DESTINO_ID) return DriveApp.getFolderById(CONFIG.PASTA_DESTINO_ID);
+  const pastas = DriveApp.getRootFolder().getFoldersByName(CONFIG.NOME_PASTA_PADRAO);
+  return pastas.hasNext() ? pastas.next() : DriveApp.getRootFolder().createFolder(CONFIG.NOME_PASTA_PADRAO);
+}
+
+/**
+ * "merged_docs - <assunto> - <data>", sem caracteres inválidos em nomes de arquivo.
+ */
+function montarNomeArquivo(assunto) {
+  const data = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
+  const assuntoLimpo = String(assunto || "sem assunto")
+    .replace(/^((re|res|fw|fwd|enc|tr)\s*:\s*)+/i, "")
+    .replace(/[\\\/:*?"<>|\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .substring(0, 120);
+  return `${CONFIG.PREFIXO_ARQUIVO} - ${assuntoLimpo} - ${data}`;
+}
+
+function escaparHtml(texto) {
+  return String(texto || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
