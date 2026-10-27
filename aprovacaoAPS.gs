@@ -472,6 +472,9 @@ function obterAnexosPdfUnicos(messages) {
 function gerarPdfDoEmail(messages) {
   const contador = { externas: 0 };
   const partes = messages.map(msg => {
+    const fontes = (msg.getBody().match(/<img\b[^>]*?\bsrc\s*=\s*["'][^"']{0,80}/gi) || [])
+      .map(tag => tag.replace(/^.*src\s*=\s*["']/i, ""));
+    if (fontes.length) Logger.log(`[DEBUG] Imagens no e-mail ${msg.getId()}: ${fontes.join(" | ")}`);
     const corpo = incorporarImagensExternas(incorporarImagensEmbutidas(msg.getBody(), msg.getId()), contador);
     return `
       <div style="font-family:Arial,sans-serif;font-size:12px;border-bottom:1px solid #999;padding-bottom:8px;margin-bottom:12px">
@@ -512,7 +515,12 @@ function incorporarImagensEmbutidas(html, messageId) {
 
     return html.replace(/(["'])cid:([^"']+)\1/gi, (original, aspas, cid) => {
       const dataUri = imagens[decodeURIComponent(cid).trim()];
-      return dataUri ? aspas + dataUri + aspas : original;
+      if (!dataUri) {
+        Logger.log(`[AVISO] Imagem "cid:${cid}" não encontrada no e-mail ${messageId}. ` +
+          `Content-IDs disponíveis: ${Object.keys(imagens).join(", ") || "nenhum"}`);
+        return original;
+      }
+      return aspas + dataUri + aspas;
     });
   } catch (erro) {
     Logger.log(`[AVISO] Não foi possível incorporar as imagens embutidas do e-mail ${messageId}: ${erro}`);
@@ -534,6 +542,8 @@ function incorporarImagensExternas(html, contador) {
       const blob = resposta.getBlob();
       const tipo = String(blob.getContentType() || "");
       if (resposta.getResponseCode() !== 200 || !/^image\//i.test(tipo) || blob.getBytes().length > CONFIG.MAX_BYTES_IMAGEM) {
+        Logger.log(`[AVISO] Imagem ${url} não incorporada: HTTP ${resposta.getResponseCode()}, ` +
+          `tipo "${tipo}", ${blob.getBytes().length} bytes.`);
         return original;
       }
       return `${prefixo}${aspas}data:${tipo};base64,${Utilities.base64Encode(blob.getBytes())}${aspas}`;
