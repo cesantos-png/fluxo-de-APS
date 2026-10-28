@@ -17,7 +17,7 @@
  *
  * DOCUMENTO CONSOLIDADO:
  * - Para cada AP aprovada são gerados na pasta de destino:
- *     merged_docs - <assunto> - <data>.pdf  -> anexos .pdf da thread + e-mail de aprovação (por último)
+ *     merged_docs - <assunto> - <data>.pdf  -> anexos .pdf da thread + mensagem de aprovação (por último)
  *     merged_docs - <assunto> - <data>.eml  -> e-mail de aprovação original (comprovante)
  * - Os anexos .pdf são ordenados pelo TIPO de documento, identificado pelo texto
  *   de dentro do PDF (não pelo nome do arquivo), na ordem de ORDEM_DOCUMENTOS.
@@ -449,7 +449,7 @@ function converterXlsmParaGoogleSheets(blobAnexo) {
 }
 
 /**
- * Junta os anexos .pdf da thread (na ordem em que chegaram) com o e-mail de
+ * Junta os anexos .pdf da thread (ordenados por tipo) com a mensagem de
  * aprovação (por último) num único PDF e salva também o .eml original.
  * Retorna o link do PDF no Drive.
  */
@@ -458,7 +458,7 @@ async function gerarDocumentoConsolidado(thread, messages, assunto) {
   const nomeBase = montarNomeArquivo(assunto);
 
   const documentos = ordenarDocumentos(obterAnexosPdfUnicos(messages));
-  documentos.push(gerarPdfDoEmail(messages));
+  documentos.push(gerarPdfDoEmail(ultimaMensagem));
 
   const pdfFinal = await juntarPdfs(documentos);
   const pasta = obterPastaDestino();
@@ -549,30 +549,26 @@ function obterAnexosPdfUnicos(messages) {
 }
 
 /**
- * Gera um PDF com todas as mensagens da thread (cabeçalho + corpo HTML).
+ * Gera um PDF só com a mensagem de aprovação (cabeçalho + corpo HTML).
  * As imagens embutidas (cid:) e as hospedadas na internet são incorporadas
  * ao HTML antes da conversão, para que assinaturas e logos apareçam no PDF.
  */
-function gerarPdfDoEmail(messages) {
-  const contador = { externas: 0 };
-  const partes = messages.map(msg => {
-    const fontes = (msg.getBody().match(/<img\b[^>]*?\bsrc\s*=\s*["'][^"']{0,80}/gi) || [])
-      .map(tag => tag.replace(/^.*src\s*=\s*["']/i, ""));
-    if (fontes.length) Logger.log(`[DEBUG] Imagens no e-mail ${msg.getId()}: ${fontes.join(" | ")}`);
-    const corpo = incorporarImagensExternas(incorporarImagensEmbutidas(msg.getBody(), msg.getId()), contador);
-    return `
-      <div style="font-family:Arial,sans-serif;font-size:12px;border-bottom:1px solid #999;padding-bottom:8px;margin-bottom:12px">
-        <b>De:</b> ${escaparHtml(msg.getFrom())}<br>
-        <b>Para:</b> ${escaparHtml(msg.getTo())}<br>
-        ${msg.getCc() ? `<b>Cc:</b> ${escaparHtml(msg.getCc())}<br>` : ""}
-        <b>Data:</b> ${Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm")}<br>
-        <b>Assunto:</b> ${escaparHtml(msg.getSubject())}
-      </div>
-      <div>${corpo}</div>
-      <div style="page-break-after:always"></div>`;
-  });
+function gerarPdfDoEmail(msg) {
+  const fontes = (msg.getBody().match(/<img\b[^>]*?\bsrc\s*=\s*["'][^"']{0,80}/gi) || [])
+    .map(tag => tag.replace(/^.*src\s*=\s*["']/i, ""));
+  if (fontes.length) Logger.log(`[DEBUG] Imagens no e-mail ${msg.getId()}: ${fontes.join(" | ")}`);
+  const corpo = incorporarImagensExternas(incorporarImagensEmbutidas(msg.getBody(), msg.getId()), { externas: 0 });
 
-  const html = `<html><head><meta charset="UTF-8"></head><body>${partes.join("")}</body></html>`;
+  const html = `<html><head><meta charset="UTF-8"></head><body>
+    <div style="font-family:Arial,sans-serif;font-size:12px;border-bottom:1px solid #999;padding-bottom:8px;margin-bottom:12px">
+      <b>De:</b> ${escaparHtml(msg.getFrom())}<br>
+      <b>Para:</b> ${escaparHtml(msg.getTo())}<br>
+      ${msg.getCc() ? `<b>Cc:</b> ${escaparHtml(msg.getCc())}<br>` : ""}
+      <b>Data:</b> ${Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm")}<br>
+      <b>Assunto:</b> ${escaparHtml(msg.getSubject())}
+    </div>
+    <div>${corpo}</div>
+  </body></html>`;
   return Utilities.newBlob(html, MimeType.HTML, "email.html").getAs(MimeType.PDF);
 }
 
