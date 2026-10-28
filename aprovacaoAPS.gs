@@ -18,6 +18,9 @@
  * DOCUMENTO CONSOLIDADO:
  * - Para cada AP aprovada são gerados na pasta de destino:
  *     merged_docs - <assunto> - <data>.pdf  -> anexos .pdf da thread + e-mail de aprovação (por último)
+ * - Os anexos .pdf seguem ORDEM_DOCUMENTOS: primeiro os que têm a 1ª palavra no
+ *   nome, depois os da 2ª, e assim por diante; os que não casam com nenhuma vêm
+ *   em seguida, na ordem em que chegaram. O e-mail de aprovação é sempre o último.
  *     merged_docs - <assunto> - <data>.eml  -> e-mail de aprovação original (comprovante)
  * - A junção dos PDFs usa a biblioteca pdf-lib, baixada de PDF_LIB_URL a cada execução.
  * - PDFs protegidos por senha podem falhar; assinaturas digitais de PDFs anexados
@@ -46,7 +49,8 @@ const CONFIG = {
   PREFIXO_ARQUIVO: "merged_docs",
   PDF_LIB_URL: "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js",
   MAX_IMAGENS_EXTERNAS: 20,        // Imagens da internet (ex.: assinaturas hospedadas) embutidas no PDF do e-mail
-  MAX_BYTES_IMAGEM: 2 * 1024 * 1024
+  MAX_BYTES_IMAGEM: 2 * 1024 * 1024,
+  ORDEM_DOCUMENTOS: ["nota", "boleto"] // Palavras no nome do .pdf, sem diferenciar maiúsculas/acentos
 };
 
 /**
@@ -434,7 +438,7 @@ async function gerarDocumentoConsolidado(thread, messages, assunto) {
   const ultimaMensagem = messages[messages.length - 1];
   const nomeBase = montarNomeArquivo(assunto);
 
-  const documentos = obterAnexosPdfUnicos(messages);
+  const documentos = ordenarDocumentos(obterAnexosPdfUnicos(messages));
   documentos.push(gerarPdfDoEmail(messages));
 
   const pdfFinal = await juntarPdfs(documentos);
@@ -445,6 +449,22 @@ async function gerarDocumentoConsolidado(thread, messages, assunto) {
   pasta.createFile(Utilities.newBlob(ultimaMensagem.getRawContent(), "message/rfc822", nomeBase + ".eml"));
 
   return arquivoPdf.getUrl();
+}
+
+/**
+ * Ordena os PDFs pela posição da primeira palavra de ORDEM_DOCUMENTOS contida
+ * no nome. Os que não casam com nenhuma ficam no fim, na ordem original
+ * (a ordenação do JavaScript é estável).
+ */
+function ordenarDocumentos(blobs) {
+  const normalizar = texto => String(texto).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  const palavras = CONFIG.ORDEM_DOCUMENTOS.map(normalizar);
+  const posicao = blob => {
+    const nome = normalizar(blob.getName());
+    const indice = palavras.findIndex(palavra => nome.includes(palavra));
+    return indice === -1 ? palavras.length : indice;
+  };
+  return blobs.slice().sort((a, b) => posicao(a) - posicao(b));
 }
 
 /**
