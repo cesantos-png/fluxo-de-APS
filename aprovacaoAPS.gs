@@ -1,59 +1,24 @@
 /**
- * Processa e-mails de aprovação de AP: migra os dados do .xlsm anexado para a
- * planilha de destino, junta os PDFs anexados com o e-mail de aprovação num
- * único PDF no Drive e notifica no Google Chat com o link.
- *
- * CONFIGURAÇÃO INICIAL (uma vez só):
- * 1. Editor > Serviços (+) > adicionar "Drive API" (v3) e "Gmail API" (v1).
- *    A Gmail API é usada para recuperar as imagens embutidas (assinaturas, logos).
- * 2. Configurações do projeto > Propriedades do script > Adicionar propriedade:
- *      Nome:  WEBHOOK_CHAT
- *      Valor: URL do NOVO webhook do Google Chat (exclua o antigo, que ficou exposto)
- * 3. Preencha APROVADORES abaixo (ou deixe vazio para aceitar qualquer remetente).
- * 4. (Opcional) Preencha PASTA_DESTINO_ID com o ID da pasta do Drive onde salvar
- *    os PDFs. Vazio = usa (ou cria) a pasta NOME_PASTA_PADRAO na raiz do Drive.
- *    Para ter os arquivos no computador, instale o "Google Drive para computador"
- *    e marque essa pasta para ficar disponível off-line.
- *
- * DOCUMENTO CONSOLIDADO:
- * - Para cada AP aprovada são gerados na pasta de destino:
- *     merged_docs - <assunto> - <data>.pdf  -> anexos .pdf da thread + mensagem de aprovação (por último)
- *     merged_docs - <assunto> - <data>.eml  -> e-mail de aprovação original (comprovante)
- * - Os anexos .pdf são ordenados pelo TIPO de documento, identificado pelo texto
- *   de dentro do PDF (não pelo nome do arquivo), na ordem de ORDEM_DOCUMENTOS.
- *   Os não identificados vêm em seguida, na ordem em que foram anexados.
- *   O e-mail de aprovação é sempre o último.
- * - A junção dos PDFs usa a biblioteca pdf-lib, baixada de PDF_LIB_URL a cada execução.
- * - PDFs protegidos por senha podem falhar; assinaturas digitais de PDFs anexados
- *   deixam de ser válidas no arquivo final (o conteúdo continua visível).
- *
- * FUNCIONAMENTO EM CASO DE ERRO:
- * - Se algum anexo falhar, a thread é tentada de novo nas próximas execuções.
- *   Anexos que já foram migrados são lembrados e NÃO são gravados de novo.
- * - Depois de MAX_TENTATIVAS falhas, a thread recebe a label LABEL_ERRO e um
- *   aviso é enviado ao Chat. Para tentar de novo, basta remover essa label
- *   do e-mail (os anexos já migrados continuam sendo pulados).
+ * Fluxo de aprovação de APs. Configuração e funcionamento: ver README.md.
  */
 
 const CONFIG = {
   SPREADSHEET_ID: "16KRDu8Y2htmGd_mihTaIU3CB3bJzhMQg-Pvn9xMIoVE",
-  NOME_DA_ABA: "APs",              // Aba de destino
-  NOME_ABA_ANEXO: "",              // Aba dentro do .xlsm de onde ler os dados. Vazio = primeira aba
+  NOME_DA_ABA: "APs",
+  NOME_ABA_ANEXO: "",              // Vazio = primeira aba do .xlsm
   LABEL_PROCESSADO: "1_Aprovações",
   LABEL_ERRO: "1_Aprovações_Erro",
-  APROVADORES: [],                 // ex.: ["gestor@empresa.com", "diretor@empresa.com"]. Vazio = qualquer remetente
+  APROVADORES: [],                 // Vazio = qualquer remetente
   MAX_THREADS_POR_EXECUCAO: 20,
   MAX_TENTATIVAS: 3,
   TEMPO_LIMITE_MS: 5 * 60 * 1000,  // Para antes do limite de 6 min do Apps Script
-  PASTA_DESTINO_ID: "",            // ID da pasta do Drive para os PDFs. Vazio = NOME_PASTA_PADRAO
+  PASTA_DESTINO_ID: "",            // Vazio = NOME_PASTA_PADRAO na raiz do Drive
   NOME_PASTA_PADRAO: "APs Aprovadas",
   PREFIXO_ARQUIVO: "merged_docs",
   PDF_LIB_URL: "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js",
-  MAX_IMAGENS_EXTERNAS: 20,        // Imagens da internet (ex.: assinaturas hospedadas) embutidas no PDF do e-mail
+  MAX_IMAGENS_EXTERNAS: 20,
   MAX_BYTES_IMAGEM: 2 * 1024 * 1024,
-  // Ordem dos anexos no PDF final. Cada tipo é reconhecido pelas marcas no texto
-  // do documento: ganha o tipo com mais marcas encontradas (empate: o primeiro da lista).
-  // Um PDF só é identificado com pelo menos MIN_MARCAS marcas do tipo.
+  // Ordem dos anexos no PDF final; ganha o tipo com mais marcas no texto (empate: o primeiro).
   ORDEM_DOCUMENTOS: [
     {
       tipo: "Nota fiscal",
@@ -72,11 +37,7 @@ const CONFIG = {
   MIN_MARCAS: 2
 };
 
-/**
- * Função principal (é esta que o gatilho deve chamar).
- * O lock impede que duas execuções processem as mesmas threads ao mesmo tempo.
- * É async porque a junção dos PDFs (pdf-lib) trabalha com Promises.
- */
+// Função chamada pelo acionador. Async porque a pdf-lib trabalha com Promises.
 async function processarEmailsAprovados() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) {
@@ -118,10 +79,6 @@ async function executarProcessamento() {
   }
 }
 
-/**
- * Processa uma thread: valida a aprovação, migra cada .xlsm (sem repetir os
- * já migrados), gera o PDF consolidado e marca a thread como processada ou com erro.
- */
 async function processarThread(thread, sheet, labelProcessado, labelErro, webhook) {
   const messages = thread.getMessages();
   const ultimaMensagem = messages[messages.length - 1];
@@ -145,7 +102,7 @@ async function processarThread(thread, sheet, labelProcessado, labelErro, webhoo
     return;
   }
 
-  // Estado da thread: quais anexos já foram migrados e quantas tentativas falharam.
+  // Estado entre execuções: anexos já migrados, tentativas e link do PDF gerado.
   const props = PropertiesService.getScriptProperties();
   const chaveEstado = "estado_" + thread.getId();
   const estado = JSON.parse(props.getProperty(chaveEstado) || '{"migrados":[],"tentativas":0}');
@@ -184,7 +141,6 @@ async function processarThread(thread, sheet, labelProcessado, labelErro, webhoo
 
   if (!houveErro) {
     props.deleteProperty(chaveEstado);
-    // Fica acessível clicando na label, como se fosse uma pasta.
     thread.markRead();
     thread.addLabel(labelProcessado);
     thread.moveToArchive();
@@ -219,10 +175,6 @@ async function processarThread(thread, sheet, labelProcessado, labelErro, webhoo
   }
 }
 
-/**
- * Converte o .xlsm, lê as células e grava uma linha na planilha de destino.
- * O arquivo temporário é sempre excluído, mesmo se der erro no meio.
- */
 function migrarAnexo(anexo, sheet) {
   let tempFileId = null;
   try {
@@ -233,23 +185,19 @@ function migrarAnexo(anexo, sheet) {
       : tempSpreadsheet.getSheets()[0];
     if (!tempSheet) throw new Error(`Aba "${CONFIG.NOME_ABA_ANEXO}" não encontrada no anexo.`);
 
-    // Lê a coluna C inteira de uma vez (muito mais rápido que várias getValue()).
     const colunaC = tempSheet.getRange("C1:C77").getValues().map(linha => linha[0]);
     const C = numeroLinha => colunaC[numeroLinha - 1];
 
-    // C25 normalmente é a iniciativa; se não estiver cadastrada, usa C27.
-    // Quando não for esse caso, C25 vem como "PREFIXO.| Valor real" - remove até o "|".
+    // C25 vem como "PREFIXO.| Iniciativa"; se for "INICIATIVA NÃO CADASTRADA", usa C27.
     const iniciativaNaoCadastrada = String(C(25)).trim().toUpperCase() === "INICIATIVA NÃO CADASTRADA";
     const valorIniciativa = iniciativaNaoCadastrada ? C(27) : removerPrefixoAntesDoPipe(C(25));
 
-    // C26 sempre entra como negativo, independente do sinal original.
     const valorC26Negativo = converterParaNegativo(C(26));
 
-    // Data de processamento (apenas a data, sem horário).
     const agora = new Date();
     const dataProcessamento = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate());
 
-    // Ordem final: C77, C17, C8, iniciativa (C25 ou C27), C74, [vazio], data, [vazio], C26 (negativo), C71
+    // Colunas A a J da aba de destino.
     const linhaDados = [
       C(77),
       C(17),
@@ -269,8 +217,7 @@ function migrarAnexo(anexo, sheet) {
       throw new Error(`Valor inválido após a conversão do anexo: ${celulaComErro}`);
     }
 
-    // Próxima linha livre considerando as colunas A a J (as que o script grava).
-    // Olhar só a coluna A fazia linhas com C77 vazio serem sobrescritas pela gravação seguinte.
+    // Considera A a J, não só A: linhas com C77 vazio seriam sobrescritas.
     const proximaLinha = obterProximaLinhaLivre(sheet, 1, linhaDados.length);
     sheet.getRange(proximaLinha, 1, 1, linhaDados.length).setValues([linhaDados]);
     SpreadsheetApp.flush();
@@ -285,21 +232,13 @@ function migrarAnexo(anexo, sheet) {
   }
 }
 
-/**
- * Verifica se o corpo da mensagem é uma aprovação.
- * Ignora o histórico citado, exige palavras inteiras ("ok" não casa com "Outlook")
- * e rejeita negações ("não aprovado", "não está de acordo").
- */
+// Palavras inteiras ("ok" não casa com "Outlook") e rejeita negações ("não aprovado").
 function verificarAprovacao(corpo) {
   const texto = removerTextoCitado(corpo).toLowerCase();
   if (/\bn[aã]o\b[^.\n]{0,30}?(\baprovad[oa]\b|\bde acordo\b|\bok\b)/.test(texto)) return false;
   return /(\baprovad[oa]\b|\bde acordo\b|\bok\b)/.test(texto);
 }
 
-/**
- * Remove o histórico citado de uma resposta de e-mail (Gmail e Outlook,
- * em português e inglês), mantendo só o texto novo.
- */
 function removerTextoCitado(corpo) {
   let texto = "\n" + String(corpo || "");
 
@@ -317,23 +256,15 @@ function removerTextoCitado(corpo) {
   }
   texto = texto.substring(0, corte);
 
-  // Remove também linhas citadas com ">".
   return texto.split("\n").filter(linha => !linha.trim().startsWith(">")).join("\n");
 }
 
-/**
- * Se APROVADORES estiver vazio, aceita qualquer remetente.
- */
 function remetenteAutorizado(remetente) {
   if (CONFIG.APROVADORES.length === 0) return true;
   const email = extrairEmail(remetente);
   return CONFIG.APROVADORES.some(aprovador => aprovador.trim().toLowerCase() === email);
 }
 
-/**
- * Lista os anexos .xlsm de todas as mensagens da thread, sem repetir
- * o mesmo arquivo (mesmo nome e tamanho) reenviado em respostas/encaminhamentos.
- */
 function obterAnexosXlsmUnicos(messages) {
   const vistos = new Set();
   return messages
@@ -351,10 +282,7 @@ function chaveAnexo(anexo) {
   return anexo.getName() + "|" + anexo.getSize();
 }
 
-/**
- * Converte o valor para negativo. Aceita número ou texto no formato
- * brasileiro ("R$ 1.500,00"). Se não der para converter, grava como veio e loga.
- */
+// Aceita número ou texto no formato "R$ 1.500,00"; se não converter, grava como veio.
 function converterParaNegativo(valor) {
   if (typeof valor === "number") return -Math.abs(valor);
   if (typeof valor === "string" && valor.trim() !== "") {
@@ -370,10 +298,6 @@ function obterOuCriarLabel(nome) {
   return GmailApp.getUserLabelByName(nome) || GmailApp.createLabel(nome);
 }
 
-/**
- * Extrai só o nome de exibição de "Nome <email@dominio.com>".
- * Se não houver esse formato, retorna o valor original.
- */
 function extrairNomeRemetente(remetente) {
   if (typeof remetente !== "string") return remetente;
   const match = remetente.match(/^(.*?)\s*<.*>$/);
@@ -381,19 +305,12 @@ function extrairNomeRemetente(remetente) {
   return nome || remetente.trim();
 }
 
-/**
- * Extrai só o endereço de e-mail de "Nome <email@dominio.com>", em minúsculas.
- */
 function extrairEmail(remetente) {
   const texto = String(remetente || "");
   const match = texto.match(/<([^>]+)>/);
   return (match ? match[1] : texto).trim().toLowerCase();
 }
 
-/**
- * Envia uma mensagem de texto pro Google Chat via webhook de entrada.
- * Não interrompe o processamento se o envio falhar (só loga o erro).
- */
 function enviarNotificacaoGoogleChat(webhookUrl, mensagem) {
   if (!webhookUrl) return;
   try {
@@ -407,10 +324,6 @@ function enviarNotificacaoGoogleChat(webhookUrl, mensagem) {
   }
 }
 
-/**
- * Remove tudo antes (e incluindo) o "|" de um texto no formato
- * "PREFIXO.| Valor real". Se não houver "|", retorna o texto aparado.
- */
 function removerPrefixoAntesDoPipe(texto) {
   if (typeof texto !== "string") return texto;
   const indice = texto.indexOf("|");
@@ -418,12 +331,6 @@ function removerPrefixoAntesDoPipe(texto) {
   return texto.substring(indice + 1).trim();
 }
 
-/**
- * Retorna o número da próxima linha vazia considerando o bloco de colunas
- * informado (a partir de colunaIndex, numColunas colunas). Uma linha conta
- * como ocupada se QUALQUER coluna do bloco tiver valor. Conteúdo solto em
- * colunas fora do bloco não afeta o resultado.
- */
 function obterProximaLinhaLivre(sheet, colunaIndex, numColunas) {
   const ultimaLinha = Math.max(sheet.getLastRow(), 1);
   const valores = sheet.getRange(1, colunaIndex, ultimaLinha, numColunas || 1).getValues();
@@ -435,10 +342,6 @@ function obterProximaLinhaLivre(sheet, colunaIndex, numColunas) {
   return 1;
 }
 
-/**
- * Converte o anexo Excel (.xlsm) para Google Sheets nativo.
- * Requer o serviço avançado Drive API (v3) ativado no projeto.
- */
 function converterXlsmParaGoogleSheets(blobAnexo) {
   const fileMetadata = {
     name: "TEMP_" + blobAnexo.getName(),
@@ -448,11 +351,6 @@ function converterXlsmParaGoogleSheets(blobAnexo) {
   return file.id;
 }
 
-/**
- * Junta os anexos .pdf da thread (ordenados por tipo) com a mensagem de
- * aprovação (por último) num único PDF e salva também o .eml original.
- * Retorna o link do PDF no Drive.
- */
 async function gerarDocumentoConsolidado(thread, messages, assunto) {
   const ultimaMensagem = messages[messages.length - 1];
   const nomeBase = montarNomeArquivo(assunto);
@@ -470,21 +368,13 @@ async function gerarDocumentoConsolidado(thread, messages, assunto) {
   return arquivoPdf.getUrl();
 }
 
-/**
- * Ordena os PDFs pelo tipo de documento (ORDEM_DOCUMENTOS), identificado pelo
- * texto de cada um. Os não identificados ficam no fim, na ordem original
- * (a ordenação do JavaScript é estável).
- */
+// A ordenação é estável: não identificados ficam no fim, na ordem original.
 function ordenarDocumentos(blobs) {
   if (blobs.length < 2) return blobs;
   const posicoes = new Map(blobs.map(blob => [blob, posicaoPorConteudo(blob)]));
   return blobs.slice().sort((a, b) => posicoes.get(a) - posicoes.get(b));
 }
 
-/**
- * Retorna o índice do tipo em ORDEM_DOCUMENTOS (ou o tamanho da lista, se não
- * identificado). Se não der para ler o texto, trata como não identificado.
- */
 function posicaoPorConteudo(blob) {
   const naoIdentificado = CONFIG.ORDEM_DOCUMENTOS.length;
   let texto;
@@ -506,11 +396,7 @@ function posicaoPorConteudo(blob) {
   return melhor.indice;
 }
 
-/**
- * Extrai o texto de um PDF convertendo-o temporariamente em Google Docs
- * (o Drive faz OCR, então funciona também com PDF escaneado).
- * O arquivo temporário é sempre excluído.
- */
+// A conversão para Google Docs faz OCR, então funciona também com PDF escaneado.
 function extrairTextoPdf(blob) {
   let tempFileId = null;
   try {
@@ -531,10 +417,6 @@ function extrairTextoPdf(blob) {
   }
 }
 
-/**
- * Lista os anexos .pdf de todas as mensagens da thread, na ordem em que
- * chegaram, sem repetir o mesmo arquivo reenviado em respostas/encaminhamentos.
- */
 function obterAnexosPdfUnicos(messages) {
   const vistos = new Set();
   return messages
@@ -548,11 +430,7 @@ function obterAnexosPdfUnicos(messages) {
     });
 }
 
-/**
- * Gera um PDF só com a mensagem de aprovação (cabeçalho + corpo HTML).
- * As imagens embutidas (cid:) e as hospedadas na internet são incorporadas
- * ao HTML antes da conversão, para que assinaturas e logos apareçam no PDF.
- */
+// Imagens são incorporadas em base64 porque o conversor não lê cid: nem baixa URLs.
 function gerarPdfDoEmail(msg) {
   const fontes = (msg.getBody().match(/<img\b[^>]*?\bsrc\s*=\s*["'][^"']{0,80}/gi) || [])
     .map(tag => tag.replace(/^.*src\s*=\s*["']/i, ""));
@@ -572,11 +450,7 @@ function gerarPdfDoEmail(msg) {
   return Utilities.newBlob(html, MimeType.HTML, "email.html").getAs(MimeType.PDF);
 }
 
-/**
- * Troca cada src="cid:..." pela imagem correspondente em base64 (data URI).
- * O GmailApp não informa o Content-ID das imagens, por isso usa a Gmail API.
- * Se algo falhar, mantém o HTML original (o PDF sai sem essas imagens).
- */
+// Usa a Gmail API porque o GmailApp não informa o Content-ID das imagens.
 function incorporarImagensEmbutidas(html, messageId) {
   if (!/cid:/i.test(html)) return html;
   try {
@@ -611,11 +485,6 @@ function incorporarImagensEmbutidas(html, messageId) {
   }
 }
 
-/**
- * Baixa as imagens <img src="http(s)://..."> e as incorpora em base64, pois o
- * conversor de HTML para PDF não busca imagens na internet. Imagens que
- * falharem, forem grandes demais ou passarem do limite ficam como estão.
- */
 function incorporarImagensExternas(html, contador) {
   return html.replace(/(<img\b[^>]*?\bsrc\s*=\s*)(["'])(https?:\/\/[^"']+)\2/gi, (original, prefixo, aspas, url) => {
     if (contador.externas >= CONFIG.MAX_IMAGENS_EXTERNAS) return original;
@@ -637,9 +506,6 @@ function incorporarImagensExternas(html, contador) {
   });
 }
 
-/**
- * Junta os PDFs na ordem recebida usando a pdf-lib.
- */
 async function juntarPdfs(blobs) {
   const PDFLib = carregarPdfLib();
   const pdfFinal = await PDFLib.PDFDocument.create();
@@ -657,11 +523,7 @@ async function juntarPdfs(blobs) {
   return Utilities.newBlob(Array.from(new Int8Array(bytes.buffer, bytes.byteOffset, bytes.length)), MimeType.PDF);
 }
 
-/**
- * Baixa e carrega a pdf-lib (uma vez por execução).
- * O Apps Script não tem setTimeout, que a pdf-lib usa entre etapas; o
- * substituto abaixo executa a função na hora, o que basta para ela.
- */
+// O Apps Script não tem setTimeout, que a pdf-lib usa entre etapas; executar na hora basta.
 let pdfLibCarregada = null;
 function carregarPdfLib() {
   if (pdfLibCarregada) return pdfLibCarregada;
@@ -673,7 +535,7 @@ function carregarPdfLib() {
     };
   }
   const codigo = UrlFetchApp.fetch(CONFIG.PDF_LIB_URL).getContentText();
-  (0, eval)(codigo); // eval indireto: executa no escopo global e define globalThis.PDFLib
+  (0, eval)(codigo); // eval indireto: roda no escopo global e define globalThis.PDFLib
   if (!globalThis.PDFLib) throw new Error("Falha ao carregar a pdf-lib.");
   pdfLibCarregada = globalThis.PDFLib;
   return pdfLibCarregada;
@@ -685,9 +547,6 @@ function obterPastaDestino() {
   return pastas.hasNext() ? pastas.next() : DriveApp.getRootFolder().createFolder(CONFIG.NOME_PASTA_PADRAO);
 }
 
-/**
- * "merged_docs - <assunto> - <data>", sem caracteres inválidos em nomes de arquivo.
- */
 function montarNomeArquivo(assunto) {
   const data = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
   const assuntoLimpo = String(assunto || "sem assunto")
