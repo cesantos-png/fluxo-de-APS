@@ -12,7 +12,7 @@ const CONFIG = {
   MAX_THREADS_POR_EXECUCAO: 20,
   MAX_TENTATIVAS: 3,
   TEMPO_LIMITE_MS: 5 * 60 * 1000,  // Para antes do limite de 6 min do Apps Script
-  PASTA_DESTINO_ID: "",            // Vazio = NOME_PASTA_PADRAO na raiz do Drive
+  PASTA_DESTINO_ID: "1XmflVPLeNPD-bnWPAOzenMfQeTw5-nKV", // Vazio = NOME_PASTA_PADRAO na raiz do Drive
   NOME_PASTA_PADRAO: "APs Aprovadas",
   PREFIXO_ARQUIVO: "merged_docs",
   PDF_LIB_URL: "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js",
