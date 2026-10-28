@@ -19,6 +19,10 @@
  * - Para cada AP aprovada são gerados na pasta de destino:
  *     merged_docs - <assunto> - <data>.pdf  -> anexos .pdf da thread + e-mail de aprovação (por último)
  *     merged_docs - <assunto> - <data>.eml  -> e-mail de aprovação original (comprovante)
+ * - Os anexos .pdf são ordenados pelo TIPO de documento, identificado pelo texto
+ *   de dentro do PDF (não pelo nome do arquivo), na ordem de ORDEM_DOCUMENTOS.
+ *   Os não identificados vêm em seguida, na ordem em que foram anexados.
+ *   O e-mail de aprovação é sempre o último.
  * - A junção dos PDFs usa a biblioteca pdf-lib, baixada de PDF_LIB_URL a cada execução.
  * - PDFs protegidos por senha podem falhar; assinaturas digitais de PDFs anexados
  *   deixam de ser válidas no arquivo final (o conteúdo continua visível).
@@ -46,7 +50,26 @@ const CONFIG = {
   PREFIXO_ARQUIVO: "merged_docs",
   PDF_LIB_URL: "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js",
   MAX_IMAGENS_EXTERNAS: 20,        // Imagens da internet (ex.: assinaturas hospedadas) embutidas no PDF do e-mail
-  MAX_BYTES_IMAGEM: 2 * 1024 * 1024
+  MAX_BYTES_IMAGEM: 2 * 1024 * 1024,
+  // Ordem dos anexos no PDF final. Cada tipo é reconhecido pelas marcas no texto
+  // do documento: ganha o tipo com mais marcas encontradas (empate: o primeiro da lista).
+  // Um PDF só é identificado com pelo menos MIN_MARCAS marcas do tipo.
+  ORDEM_DOCUMENTOS: [
+    {
+      tipo: "Nota fiscal",
+      marcas: [/\bDANFS-?e\b/i, /\bDANFE\b/i, /\bNFS-?e\b/i, /\bNF-?e\b/i, /documento auxiliar/i,
+               /chave de acesso/i, /\bprestador\b/i, /\btomador\b/i, /\bemitente\b/i,
+               /\bdestinat[aá]rio\b/i, /inscri[cç][aã]o municipal/i]
+    },
+    {
+      tipo: "Boleto",
+      marcas: [/linha digit[aá]vel/i, /ficha de compensa[cç][aã]o/i, /local de pagamento/i,
+               /\bbenefici[aá]rio\b/i, /\bcedente\b/i, /\bsacado\b/i, /\bpagador\b/i, /nosso n[uú]mero/i,
+               /autentica[cç][aã]o mec[aâ]nica/i, /recibo do pagador/i,
+               /\d{5}\.?\d{5}\s+\d{5}\.?\d{6}\s+\d{5}\.?\d{6}\s+\d\s+\d{14}/]
+    }
+  ],
+  MIN_MARCAS: 2
 };
 
 /**
@@ -434,7 +457,7 @@ async function gerarDocumentoConsolidado(thread, messages, assunto) {
   const ultimaMensagem = messages[messages.length - 1];
   const nomeBase = montarNomeArquivo(assunto);
 
-  const documentos = obterAnexosPdfUnicos(messages);
+  const documentos = ordenarDocumentos(obterAnexosPdfUnicos(messages));
   documentos.push(gerarPdfDoEmail(messages));
 
   const pdfFinal = await juntarPdfs(documentos);
@@ -445,6 +468,67 @@ async function gerarDocumentoConsolidado(thread, messages, assunto) {
   pasta.createFile(Utilities.newBlob(ultimaMensagem.getRawContent(), "message/rfc822", nomeBase + ".eml"));
 
   return arquivoPdf.getUrl();
+}
+
+/**
+ * Ordena os PDFs pelo tipo de documento (ORDEM_DOCUMENTOS), identificado pelo
+ * texto de cada um. Os não identificados ficam no fim, na ordem original
+ * (a ordenação do JavaScript é estável).
+ */
+function ordenarDocumentos(blobs) {
+  if (blobs.length < 2) return blobs;
+  const posicoes = new Map(blobs.map(blob => [blob, posicaoPorConteudo(blob)]));
+  return blobs.slice().sort((a, b) => posicoes.get(a) - posicoes.get(b));
+}
+
+/**
+ * Retorna o índice do tipo em ORDEM_DOCUMENTOS (ou o tamanho da lista, se não
+ * identificado). Se não der para ler o texto, trata como não identificado.
+ */
+function posicaoPorConteudo(blob) {
+  const naoIdentificado = CONFIG.ORDEM_DOCUMENTOS.length;
+  let texto;
+  try {
+    texto = extrairTextoPdf(blob);
+  } catch (erro) {
+    Logger.log(`[AVISO] Não foi possível ler o texto de "${blob.getName()}"; mantido na ordem original. ${erro}`);
+    return naoIdentificado;
+  }
+
+  let melhor = { indice: naoIdentificado, marcas: 0 };
+  CONFIG.ORDEM_DOCUMENTOS.forEach((tipo, indice) => {
+    const marcas = tipo.marcas.filter(marca => marca.test(texto)).length;
+    if (marcas >= CONFIG.MIN_MARCAS && marcas > melhor.marcas) melhor = { indice, marcas };
+  });
+
+  const nomeTipo = melhor.indice < naoIdentificado ? CONFIG.ORDEM_DOCUMENTOS[melhor.indice].tipo : "não identificado";
+  Logger.log(`[DEBUG] "${blob.getName()}": ${nomeTipo} (${melhor.marcas} marca(s)).`);
+  return melhor.indice;
+}
+
+/**
+ * Extrai o texto de um PDF convertendo-o temporariamente em Google Docs
+ * (o Drive faz OCR, então funciona também com PDF escaneado).
+ * O arquivo temporário é sempre excluído.
+ */
+function extrairTextoPdf(blob) {
+  let tempFileId = null;
+  try {
+    tempFileId = Drive.Files.create(
+      { name: "TEMP_" + blob.getName(), mimeType: MimeType.GOOGLE_DOCS },
+      blob.copyBlob(),
+      { ocrLanguage: "pt" }
+    ).id;
+    return DocumentApp.openById(tempFileId).getBody().getText();
+  } finally {
+    if (tempFileId) {
+      try {
+        DriveApp.getFileById(tempFileId).setTrashed(true);
+      } catch (erro) {
+        Logger.log(`[AVISO] Não foi possível excluir o arquivo temporário ${tempFileId}: ${erro}`);
+      }
+    }
+  }
 }
 
 /**
